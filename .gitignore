@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# LibreChat data (large files, sensitive)
+LibreChat-UI/data-node/
+LibreChat-UI/meili_data_v1.12/
+LibreChat-UI/logs/
+LibreChat-UI/uploads/
+LibreChat-UI/images/
+LibreChat-UI/.env
+
+# OS
+.DS_Store
+Thumbs.db

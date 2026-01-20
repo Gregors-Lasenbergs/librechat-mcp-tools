@@ -1,0 +1,27 @@
+# LibreChat Configuration
+# For more information: https://www.librechat.ai/docs/configuration/librechat_yaml
+
+version: 1.2.1
+
+cache: true
+
+interface:
+  mcpServers:
+    use: true      # Allow using MCP servers
+    create: true   # Allow creating new MCP servers
+    share: false
+    public: false
+
+# MCP Server Configuration
+# Connect to your custom web search server running on your Mac
+mcpServers:
+  web-search:
+    type: sse
+    url: http://host.docker.internal:8080/sse
+    timeout: 60000  # 1 minute timeout
+
+# Allow MCP to connect to your Mac from inside Docker
+mcpSettings:
+  allowedDomains:
+    - 'host.docker.internal'
+    - 'localhost'
