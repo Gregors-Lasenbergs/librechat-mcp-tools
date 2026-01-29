@@ -1,134 +1,215 @@
 """
-Web Scraper MCP Server
-This tool fetches the full content from a URL and extracts readable text.
-Use it to get detailed information from pages found via web search.
-"""
-from typing import Any
-from mcp.server.lowlevel import Server
-from mcp.server.sse import SseServerTransport
-import mcp.types as types
-from starlette.applications import Starlette
-from starlette.routing import Route, Mount
-from starlette.requests import Request
-from starlette.responses import Response, JSONResponse
-import uvicorn
-import httpx
-from bs4 import BeautifulSoup
+Web Scraper MCP Server (Playwright Edition)
 
+Fetches web pages using a headless browser and extracts readable text content.
+Uses Playwright for JavaScript rendering - works with modern SPAs and dynamic sites.
+
+To run:
+    pip install -r requirements.txt
+    playwright install chromium
+    python server.py
+
+Environment variables:
+    MCP_DEBUG=true                  Enable debug mode
+    MCP_REQUEST_TIMEOUT=30.0        Page load timeout (seconds)
+    MCP_MAX_CONTENT_LENGTH=15000    Maximum characters to return
+"""
+
+import sys
+import asyncio
+from pathlib import Path
+from typing import Any, List
+
+# Add parent directory to path for common module
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import mcp.types as types
+from bs4 import BeautifulSoup
+from mcp.server.lowlevel import Server
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+
+from common import (
+    config,
+    get_logger,
+    validate_url,
+    create_starlette_app,
+    create_error_response,
+    run_server,
+)
+
+logger = get_logger("scraper-server")
+
+# Server configuration
+SERVER_NAME = "Web Scraper MCP Server"
+SERVER_PORT = 8081
+
+# Elements to remove (non-content elements)
+REMOVE_ELEMENTS = [
+    "script",
+    "style",
+    "noscript",
+    "iframe",
+    "svg",
+    "canvas",
+    "video",
+    "audio",
+    "form",
+    "button",
+    "input",
+    "select",
+    "textarea",
+    "nav",
+    "footer",
+    "header",
+    "aside",
+]
 
 # Create the MCP server instance
-app = Server("web-scraper")
+mcp_server = Server("web-scraper")
 
 
-@app.list_tools()
-async def list_tools() -> list[types.Tool]:
-    """Tell LibreChat what tools this server provides."""
+@mcp_server.list_tools()
+async def list_tools() -> List[types.Tool]:
+    """Tell clients what tools this server provides."""
     return [
         types.Tool(
             name="scrape_url",
-            description="Fetch a webpage and extract its text content. Use this to get the full content of a URL found in search results.",
+            description=(
+                "Fetch a webpage using a headless browser and extract its text content. "
+                "Works with JavaScript-rendered pages and modern websites. "
+                "Use this to get the full content of a URL found in search results."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "The URL to fetch and extract content from"
-                    }
+                        "description": "The URL to fetch (must be http or https)",
+                    },
+                    "wait_for_js": {
+                        "type": "boolean",
+                        "description": "Wait extra time for JavaScript to render (default: true)",
+                        "default": True,
+                    },
                 },
-                "required": ["url"]
-            }
+                "required": ["url"],
+            },
         )
     ]
 
-@app.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
+
+@mcp_server.call_tool()
+async def call_tool(name: str, arguments: dict[str, Any]) -> List[types.TextContent]:
     """Handle tool calls from the LLM."""
     if name == "scrape_url":
         return await scrape_url(arguments)
     else:
-        return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
+        logger.warning(f"Unknown tool requested: {name}")
+        return create_error_response(f"Unknown tool: {name}")
 
-async def scrape_url(arguments: dict[str, Any]) -> list[types.TextContent]:
-    """Fetch the URL and extract its text content."""
+
+async def scrape_url(arguments: dict[str, Any]) -> List[types.TextContent]:
+    """
+    Fetch a URL using Playwright and extract its text content.
+    
+    Args:
+        arguments: Tool arguments containing 'url' and optional 'wait_for_js'
+        
+    Returns:
+        List of TextContent with page content or error
+    """
     url = arguments.get("url", "")
-
-    if not url:
-        return [types.TextContent(type="text", text="Error: No URL provided")]
-
-    print(f"[scraper] Fetching: {url}")
-
+    wait_for_js = arguments.get("wait_for_js", True)
+    
+    # Validate URL (security check)
+    is_valid, error_message = validate_url(url)
+    if not is_valid:
+        logger.warning(f"URL validation failed for '{url}': {error_message}")
+        return create_error_response(error_message)
+    
+    url = url.strip()
+    logger.info(f"Fetching URL with Playwright: {url}")
+    
     try:
-        # Fetch the webpage
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-        }
-
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, follow_redirects=True, timeout=15.0)
-            response.raise_for_status()
-            html = response.text
-
+        async with async_playwright() as p:
+            # Launch headless browser
+            browser = await p.chromium.launch(headless=True)
+            
+            # Create a new page with a realistic viewport
+            context = await browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            )
+            page = await context.new_page()
+            
+            # Navigate to the URL
+            timeout_ms = int(config.request_timeout * 1000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            
+            # Wait for JavaScript to render if requested
+            if wait_for_js:
+                await page.wait_for_timeout(1500)  # 1.5 seconds for JS rendering
+            
+            # Get the page content
+            html = await page.content()
+            
+            # Get the title
+            title = await page.title() or "No title"
+            
+            # Close the browser
+            await browser.close()
+        
+        logger.info(f"Successfully loaded {url}")
+        
         # Parse HTML and extract text
         soup = BeautifulSoup(html, "html.parser")
-
-        # Remove script and style elements (removes JavaScript code)
-        for element in soup(["script", "style", "nav", "footer", "header"]):
+        
+        # Remove non-content elements
+        for element in soup(REMOVE_ELEMENTS):
             element.decompose()
-
+        
+        # Try to find main content area
+        main_content = (
+            soup.find("main") or
+            soup.find("article") or
+            soup.find(id="content") or
+            soup.find(class_="content") or
+            soup.find(role="main") or
+            soup.find("body") or
+            soup
+        )
+        
         # Get text content
-        text = soup.get_text(separator="\n", strip=True)
-
+        text = main_content.get_text(separator="\n", strip=True)
+        
         # Clean up extra whitespace
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         clean_text = "\n".join(lines)
-
-        # Limit length (context limit)
-        if len(clean_text) > 10000:
-            clean_text = clean_text[:10000] + "\n\n[Content truncated...]"
-
-        print(f"[scraper] Extracted {len(clean_text)} characters from {url}")
-
-        return [types.TextContent(type="text", text=f"## Content from {url}\n\n{clean_text}")]
-
+        
+        # Truncate if too long
+        if len(clean_text) > config.max_content_length:
+            clean_text = clean_text[:config.max_content_length] + "\n\n[Content truncated...]"
+        
+        logger.info(f"Extracted {len(clean_text)} characters from {url}")
+        
+        return [types.TextContent(
+            type="text",
+            text=f"## {title}\n**URL:** {url}\n\n{clean_text}"
+        )]
+        
+    except PlaywrightTimeout:
+        logger.error(f"Timeout loading {url}")
+        return create_error_response(f"Page load timed out after {config.request_timeout} seconds")
     except Exception as e:
-        print(f"[scraper] Error: {str(e)}")
-        return [types.TextContent(type="text", text=f"Error fetching URL: {str(e)}")]
+        logger.error(f"Error fetching {url}: {e}")
+        return create_error_response(f"Failed to fetch URL: {str(e)}")
 
-# Create the SSE transport
-sse = SseServerTransport("/messages/")
 
-async def handle_sse(request: Request) -> Response:
-    """Handle SSE connection from LibreChat."""
-    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-        await app.run(streams[0], streams[1], app.create_initialization_options())
-    return Response()
-
-async def health(request: Request) -> JSONResponse:
-    """Health check endpoint."""
-    return JSONResponse({"status": "ok", "server": "web-scraper"})
-
-# Create the Starlette web app
-starlette_app = Starlette(
-    debug=True,
-    routes=[
-        Route("/health", health),
-        Route("/sse", endpoint=handle_sse, methods=["GET"]),
-        Mount("/messages/", app=sse.handle_post_message),
-    ],
-)
-
+# Create and run the app
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Web Scraper MCP Server")
-    print("=" * 60)
-    print("")
-    print("Starting server at: http://localhost:8081")
-    print("")
-    print("Endpoints:")
-    print("  - SSE:     http://localhost:8081/sse")
-    print("  - Health:  http://localhost:8081/health")
-    print("")
-    print("Configure LibreChat to connect to: http://host.docker.internal:8081/sse")
-    print("=" * 60)
-
-    uvicorn.run(starlette_app, host="0.0.0.0", port=8081)
+    app = create_starlette_app(mcp_server, SERVER_NAME, SERVER_PORT)
+    run_server(app, SERVER_PORT, SERVER_NAME)

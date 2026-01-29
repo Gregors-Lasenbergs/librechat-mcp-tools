@@ -1,137 +1,180 @@
 """
-Custom MCP Web Search Server (SSE Transport)
+Web Search MCP Server
 
-This is a simple MCP server that provides web search functionality using DuckDuckGo.
+Provides web search functionality using DuckDuckGo.
 No API key required - completely free!
-
-How it works:
-1. This server runs on your Mac and exposes an HTTP endpoint
-2. LibreChat (in Docker) connects to it via SSE (Server-Sent Events)
-3. When the LLM needs to search the web, it calls our "web_search" tool
-4. We search DuckDuckGo and return the results
-5. The LLM uses these results to answer the user's question
 
 To run:
     pip install -r requirements.txt
     python server.py
 
-Server will start at: http://localhost:8080/sse
+Environment variables:
+    MCP_DEBUG=true              Enable debug mode
+    MCP_RATE_LIMIT_SECONDS=1.0  Minimum seconds between requests
+    MCP_MAX_SEARCH_RESULTS=20   Maximum results allowed
 """
 
-from typing import Any
-from mcp.server.lowlevel import Server
-from mcp.server.sse import SseServerTransport
+import sys
+import time
+from pathlib import Path
+from typing import Any, List
+
+# Add parent directory to path for common module
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import mcp.types as types
-from starlette.applications import Starlette
-from starlette.routing import Route, Mount
-from starlette.requests import Request
-from starlette.responses import Response, JSONResponse
-import uvicorn
-import httpx
-import re
+from ddgs import DDGS
+from mcp.server.lowlevel import Server
+
+from common import (
+    config,
+    get_logger,
+    validate_max_results,
+    create_starlette_app,
+    create_error_response,
+    run_server,
+)
+
+logger = get_logger("search-server")
+
+# Server configuration
+SERVER_NAME = "Web Search MCP Server"
+SERVER_PORT = 8080
+
+# Rate limiting state
+_last_request_time: float = 0.0
+
+
+def _check_rate_limit() -> bool:
+    """
+    Check if we're within rate limits.
+    
+    Returns:
+        True if request is allowed, False if rate limited
+    """
+    global _last_request_time
+    now = time.time()
+    
+    if now - _last_request_time < config.rate_limit_seconds:
+        return False
+    
+    _last_request_time = now
+    return True
 
 
 # Create the MCP server instance
-app = Server("web-search")
+mcp_server = Server("web-search")
 
 
-@app.list_tools()
-async def list_tools() -> list[types.Tool]:
-    """
-    Tell LibreChat what tools this server provides.
-    """
+@mcp_server.list_tools()
+async def list_tools() -> List[types.Tool]:
+    """Tell clients what tools this server provides."""
     return [
         types.Tool(
             name="web_search",
-            description="Search the web using DuckDuckGo. Use this to find current information, news, facts, or any information not in your training data.",
+            description=(
+                "Search the web using DuckDuckGo. Returns general web pages. "
+                "Use this for finding information, documentation, tutorials, etc."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search query to look up"
+                        "description": "The search query to look up",
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Maximum number of results to return (default: 5)",
-                        "default": 5
-                    }
+                        "description": f"Number of results (1-{config.max_search_results}, default: {config.default_search_results})",
+                        "minimum": config.min_search_results,
+                        "maximum": config.max_search_results,
+                        "default": config.default_search_results,
+                    },
                 },
-                "required": ["query"]
-            }
-        )
+                "required": ["query"],
+            },
+        ),
+        types.Tool(
+            name="news_search",
+            description=(
+                "Search for recent news articles using DuckDuckGo News. "
+                "Use this when the user asks for current events, recent news, or latest updates."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The news topic to search for",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": f"Number of results (1-{config.max_search_results}, default: {config.default_search_results})",
+                        "minimum": config.min_search_results,
+                        "maximum": config.max_search_results,
+                        "default": config.default_search_results,
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
     ]
 
 
-@app.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
-    """
-    Handle tool calls from the LLM.
-    """
+@mcp_server.call_tool()
+async def call_tool(name: str, arguments: dict[str, Any]) -> List[types.TextContent]:
+    """Handle tool calls from the LLM."""
     if name == "web_search":
         return await do_web_search(arguments)
+    elif name == "news_search":
+        return await do_news_search(arguments)
     else:
-        return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
+        logger.warning(f"Unknown tool requested: {name}")
+        return create_error_response(f"Unknown tool: {name}")
 
 
-async def do_web_search(arguments: dict[str, Any]) -> list[types.TextContent]:
+async def do_web_search(arguments: dict[str, Any]) -> List[types.TextContent]:
     """
-    Perform web search using DuckDuckGo's HTML interface.
+    Perform web search using DuckDuckGo.
+    
+    Args:
+        arguments: Tool arguments containing 'query' and optional 'max_results'
+        
+    Returns:
+        List of TextContent with search results or error
     """
+    # Validate query
     query = arguments.get("query", "")
-    max_results = arguments.get("max_results", 5)
+    if not query or not isinstance(query, str):
+        return create_error_response("No search query provided")
     
+    query = query.strip()
     if not query:
-        return [types.TextContent(type="text", text="Error: No search query provided")]
+        return create_error_response("Search query is empty")
     
-    print(f"[web_search] Searching for: {query}")
+    # Validate max_results
+    max_results = validate_max_results(arguments.get("max_results"))
+    
+    # Check rate limit
+    if not _check_rate_limit():
+        logger.warning(f"Rate limited search request for: {query}")
+        return create_error_response(
+            f"Rate limited. Please wait {config.rate_limit_seconds} seconds between requests."
+        )
+    
+    logger.info(f"Web search for: '{query}' (max_results={max_results})")
     
     try:
-        # Use DuckDuckGo HTML search
-        url = "https://html.duckduckgo.com/html/"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
         
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url,
-                data={"q": query},
-                headers=headers,
-                follow_redirects=True,
-                timeout=10.0
-            )
-            response.raise_for_status()
-            html = response.text
-        
-        # Parse results from HTML
-        results = []
-        
-        # Find all result blocks
-        result_pattern = r'<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>([^<]+)</a>'
-        snippet_pattern = r'<a class="result__snippet"[^>]*>([^<]+(?:<[^>]+>[^<]*</[^>]+>)*[^<]*)</a>'
-        
-        links = re.findall(result_pattern, html)
-        snippets = re.findall(snippet_pattern, html)
-        
-        # Clean up snippets (remove HTML tags)
-        clean_snippets = []
-        for snippet in snippets:
-            clean = re.sub(r'<[^>]+>', '', snippet)
-            clean_snippets.append(clean.strip())
-        
-        for i, (href, title) in enumerate(links[:max_results]):
-            snippet = clean_snippets[i] if i < len(clean_snippets) else "No description"
-            results.append({
-                "title": title.strip(),
-                "href": href,
-                "body": snippet
-            })
-        
-        print(f"[web_search] Found {len(results)} results")
+        logger.info(f"Found {len(results)} web results for: '{query}'")
         
         if not results:
-            return [types.TextContent(type="text", text=f"No results found for: {query}")]
+            return [types.TextContent(
+                type="text",
+                text=f"No results found for: {query}"
+            )]
         
         # Format results for the LLM
         formatted_results = []
@@ -143,57 +186,82 @@ async def do_web_search(arguments: dict[str, Any]) -> list[types.TextContent]:
                 f"Snippet: {result.get('body', 'No description')}\n"
             )
         
-        output = f"## Search Results for: {query}\n\n" + "\n---\n".join(formatted_results)
+        output = f"## Web Search Results for: {query}\n\n" + "\n---\n".join(formatted_results)
         
         return [types.TextContent(type="text", text=output)]
         
     except Exception as e:
-        print(f"[web_search] Error: {str(e)}")
-        return [types.TextContent(type="text", text=f"Search error: {str(e)}")]
+        logger.error(f"Web search error for '{query}': {e}")
+        return create_error_response(f"Search failed: {str(e)}")
 
 
-# ============================================================================
-# SSE Transport Setup
-# ============================================================================
-
-sse = SseServerTransport("/messages/")
-
-
-async def handle_sse(request: Request) -> Response:
-    """Handle SSE connections from LibreChat"""
-    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-        await app.run(streams[0], streams[1], app.create_initialization_options())
-    return Response()
-
-
-async def health(request: Request) -> JSONResponse:
-    """Health check endpoint"""
-    return JSONResponse({"status": "ok", "server": "web-search-mcp"})
-
-
-# Create the Starlette app
-starlette_app = Starlette(
-    debug=True,
-    routes=[
-        Route("/health", health),
-        Route("/sse", endpoint=handle_sse, methods=["GET"]),
-        Mount("/messages/", app=sse.handle_post_message),
-    ],
-)
-
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("Web Search MCP Server")
-    print("=" * 60)
-    print("")
-    print("Starting server at: http://localhost:8080")
-    print("")
-    print("Endpoints:")
-    print("  - SSE:     http://localhost:8080/sse")
-    print("  - Health:  http://localhost:8080/health")
-    print("")
-    print("Configure LibreChat to connect to: http://host.docker.internal:8080/sse")
-    print("=" * 60)
+async def do_news_search(arguments: dict[str, Any]) -> List[types.TextContent]:
+    """
+    Perform news search using DuckDuckGo News.
     
-    uvicorn.run(starlette_app, host="0.0.0.0", port=8080)
+    Args:
+        arguments: Tool arguments containing 'query' and optional 'max_results'
+        
+    Returns:
+        List of TextContent with news results or error
+    """
+    # Validate query
+    query = arguments.get("query", "")
+    if not query or not isinstance(query, str):
+        return create_error_response("No search query provided")
+    
+    query = query.strip()
+    if not query:
+        return create_error_response("Search query is empty")
+    
+    # Validate max_results
+    max_results = validate_max_results(arguments.get("max_results"))
+    
+    # Check rate limit
+    if not _check_rate_limit():
+        logger.warning(f"Rate limited news request for: {query}")
+        return create_error_response(
+            f"Rate limited. Please wait {config.rate_limit_seconds} seconds between requests."
+        )
+    
+    logger.info(f"News search for: '{query}' (max_results={max_results})")
+    
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.news(query, max_results=max_results))
+        
+        logger.info(f"Found {len(results)} news results for: '{query}'")
+        
+        if not results:
+            return [types.TextContent(
+                type="text",
+                text=f"No news found for: {query}"
+            )]
+        
+        # Format results for the LLM
+        formatted_results = []
+        for i, result in enumerate(results, 1):
+            date = result.get('date', 'Unknown date')
+            source = result.get('source', 'Unknown source')
+            formatted_results.append(
+                f"**Article {i}:**\n"
+                f"Title: {result.get('title', 'No title')}\n"
+                f"Source: {source}\n"
+                f"Date: {date}\n"
+                f"URL: {result.get('url', 'No URL')}\n"
+                f"Summary: {result.get('body', 'No summary')}\n"
+            )
+        
+        output = f"## News Results for: {query}\n\n" + "\n---\n".join(formatted_results)
+        
+        return [types.TextContent(type="text", text=output)]
+        
+    except Exception as e:
+        logger.error(f"News search error for '{query}': {e}")
+        return create_error_response(f"News search failed: {str(e)}")
+
+
+# Create and run the app
+if __name__ == "__main__":
+    app = create_starlette_app(mcp_server, SERVER_NAME, SERVER_PORT)
+    run_server(app, SERVER_PORT, SERVER_NAME)
